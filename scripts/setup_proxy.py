@@ -191,7 +191,11 @@ def main():
 
     sub_url, output_path = sys.argv[1], sys.argv[2]
 
-    print(f"拉取订阅: {sub_url[:60]}...")
+    # 脱敏：只显示域名，隐藏 token 等敏感参数
+    from urllib.parse import urlparse
+    parsed = urlparse(sub_url)
+    masked_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+    print(f"拉取订阅: {masked_url}")
     r = requests.get(sub_url, timeout=30, headers={"User-Agent": "clash-meta"})
     r.raise_for_status()
 

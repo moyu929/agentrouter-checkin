@@ -35,8 +35,7 @@ jobs:
 
           echo "=== [1/5] 拉取订阅并生成 mihomo 配置 ==="
           python scripts/setup_proxy.py "$SUB_URL" mihomo_config.yaml
-          echo "--- 配置文件前 50 行 ---"
-          head -n 50 mihomo_config.yaml
+          echo "配置文件已生成（节点详情已隐藏，避免泄露凭证）"
 
           echo "=== [2/5] 下载 mihomo ==="
           MIMOMO_VER="v1.18.10"

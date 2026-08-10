@@ -44,6 +44,39 @@ def log(level: str, msg: str):
     print(f"[{ts}] [{level}] {msg}", flush=True)
 
 
+def mask_value(val: str, show: int = 8) -> str:
+    """脱敏字符串：只显示前 show 个字符，后面用 ... 代替"""
+    if not val:
+        return "(空)"
+    if len(val) <= show:
+        return f"{val}...(长度:{len(val)})"
+    return f"{val[:show]}...(长度:{len(val)})"
+
+
+def mask_cookies(cookies_dict: dict) -> str:
+    """脱敏 cookies 字典：只显示 key 和值的长度"""
+    if not cookies_dict:
+        return "{}"
+    items = []
+    for k, v in cookies_dict.items():
+        items.append(f"{k}: {mask_value(v)}")
+    return "{" + ", ".join(items) + "}"
+
+
+def mask_set_cookie(header_val: str) -> str:
+    """脱敏 Set-Cookie 头：保留 cookie 名和属性，值截断"""
+    if not header_val:
+        return "(无)"
+    # Set-Cookie 可能含多个 cookie（逗号分隔），但 Expires 日期也含逗号
+    # 简单处理：用正则把 =值; 中的长值截断（>20 字符的值）
+    def replacer(m):
+        val = m.group(1)
+        if len(val) > 20:
+            return f"={val[:8]}...(长度:{len(val)});"
+        return m.group(0)
+    return re.sub(r"=([^;]{20,});", replacer, header_val)
+
+
 def build_session() -> requests.Session:
     """构建请求会话，按需配置代理"""
     sess = requests.Session()
@@ -68,7 +101,7 @@ def get_oauth_state(sess: requests.Session) -> str | None:
     log("INFO", "Step 1: 获取 OAuth state...")
     req_url = f"{SITE_URL}/api/oauth/state?mode=login"
     log("DEBUG", f"请求: GET {req_url}")
-    log("DEBUG", f"当前会话 cookies: {dict(sess.cookies)}")
+    log("DEBUG", f"当前会话 cookies: {mask_cookies(dict(sess.cookies))}")
 
     try:
         resp = sess.get(req_url, timeout=30)
@@ -78,7 +111,7 @@ def get_oauth_state(sess: requests.Session) -> str | None:
 
     log("DEBUG", f"响应: HTTP {resp.status_code}")
     log("DEBUG", f"响应头: Content-Type={resp.headers.get('Content-Type')}, Content-Length={resp.headers.get('Content-Length')}")
-    log("DEBUG", f"Set-Cookie: {resp.headers.get('Set-Cookie', '(无)')}")
+    log("DEBUG", f"Set-Cookie: {mask_set_cookie(resp.headers.get('Set-Cookie', ''))}")
     log("DEBUG", f"响应 body 前 500 字符: {resp.text[:500]!r}")
 
     if "aliyun_waf_aa" in resp.text:
@@ -123,7 +156,7 @@ def get_github_code(sess: requests.Session, state: str) -> str | None:
 
     log("DEBUG", f"响应: HTTP {resp.status_code}")
     log("DEBUG", f"响应头 Location: {resp.headers.get('Location', '(无)')}")
-    log("DEBUG", f"响应头 Set-Cookie: {resp.headers.get('Set-Cookie', '(无)')}")
+    log("DEBUG", f"响应头 Set-Cookie: {mask_set_cookie(resp.headers.get('Set-Cookie', ''))}")
     log("DEBUG", f"响应 body 前 500 字符: {resp.text[:500]!r}")
 
     if resp.status_code == 401 or resp.status_code == 403:
@@ -156,7 +189,7 @@ def oauth_callback(sess: requests.Session, code: str, state: str) -> dict | None
     log("INFO", "Step 3: OAuth 回调，触发签到...")
     callback_url = f"{SITE_URL}/api/oauth/github?code={code}&state={state}&mode=login"
     log("DEBUG", f"请求: GET {callback_url}")
-    log("DEBUG", f"会话 cookies: {dict(sess.cookies)}")
+    log("DEBUG", f"会话 cookies: {mask_cookies(dict(sess.cookies))}")
 
     try:
         resp = sess.get(callback_url, timeout=30)
@@ -166,7 +199,7 @@ def oauth_callback(sess: requests.Session, code: str, state: str) -> dict | None
 
     log("DEBUG", f"响应: HTTP {resp.status_code}")
     log("DEBUG", f"响应头: Content-Type={resp.headers.get('Content-Type')}")
-    log("DEBUG", f"Set-Cookie: {resp.headers.get('Set-Cookie', '(无)')}")
+    log("DEBUG", f"Set-Cookie: {mask_set_cookie(resp.headers.get('Set-Cookie', ''))}")
     log("DEBUG", f"响应 body 前 1000 字符: {resp.text[:1000]!r}")
 
     if "aliyun_waf_aa" in resp.text:
