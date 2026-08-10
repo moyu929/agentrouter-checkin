@@ -58,9 +58,9 @@ jobs:
           READY=0
           for i in {1..20}; do
             echo "尝试 $i/20..."
-            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 -x http://127.0.0.1:7890 https://www.google.com || echo "000")
-            echo "  Google 返回 HTTP $HTTP_CODE"
-            if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "204" ]; then
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 -x http://127.0.0.1:7890 https://www.gstatic.com/generate_204 || echo "000")
+            echo "  gstatic 返回 HTTP $HTTP_CODE"
+            if [ "$HTTP_CODE" = "204" ] || [ "$HTTP_CODE" = "200" ]; then
               READY=1
               break
             fi
