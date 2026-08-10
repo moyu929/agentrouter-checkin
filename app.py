@@ -117,7 +117,7 @@ def send_telegram(message: str) -> bool:
 
 # WAF Cookie 获取
 def get_waf_cookies() -> dict:
-    log("INFO", f"使用浏览器获取 WAF Cookie（访问 {SITE_URL}/login）...")
+    log("INFO", f"使用浏览器获取 WAF Cookie（访问 {SITE_URL}）...")
     waf_cookies = {}
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -138,10 +138,21 @@ def get_waf_cookies() -> dict:
         )
         page = context.new_page()
         try:
-            page.goto(f"{SITE_URL}/login", wait_until="domcontentloaded", timeout=30000)
+            # networkidle 等待网络空闲，确保阿里云 WAF 的 JS 挑战脚本执行完成
+            page.goto(f"{SITE_URL}", wait_until="networkidle", timeout=30000)
         except Exception as e:
-            log("WARN", f"访问登录页面失败: {e}")
-        page.wait_for_timeout(3000)
+            log("WARN", f"访问首页失败: {e}")
+        # 显式等待 WAF 挑战完成会种下 acw_sc__v2（关键），最多等 15 秒
+        deadline = time.time() + 15
+        got_critical = False
+        while time.time() < deadline:
+            current = {c.get("name"): c.get("value") for c in context.cookies()}
+            if "acw_sc__v2" in current:
+                got_critical = True
+                break
+            page.wait_for_timeout(500)
+        if not got_critical:
+            log("WARN", "等待 acw_sc__v2 超时（WAF 挑战可能未通过），继续尝试使用已有 cookie")
         cookies = context.cookies()
         for cookie in cookies:
             name = cookie.get("name")
@@ -178,6 +189,12 @@ def get_user_info(session: requests.Session, headers: dict) -> dict | None:
     url = f"{SITE_URL}/api/user/self"
     try:
         resp = session.get(url, headers=headers, timeout=30)
+        content_type = resp.headers.get("Content-Type", "")
+        # 200 但响应不是 JSON（WAF 拦截页、空响应等）：打印真实内容便于排查
+        if "application/json" not in content_type.lower() and not resp.text.lstrip().startswith(("{", "[")):
+            preview = resp.text[:300].replace("\n", " ")
+            log("WARN", f"API 响应非 JSON: HTTP {resp.status_code}, Content-Type={content_type!r}, body={preview!r}")
+            return None
         if resp.status_code == 200:
             data = resp.json()
             if data.get("success"):
@@ -192,9 +209,15 @@ def get_user_info(session: requests.Session, headers: dict) -> dict | None:
             else:
                 log("WARN", f"API 返回非成功: {data}")
         else:
-            log("WARN", f"API HTTP {resp.status_code}: {resp.text[:200]}")
+            preview = resp.text[:300].replace("\n", " ")
+            log("WARN", f"API HTTP {resp.status_code}: Content-Type={content_type!r}, body={preview!r}")
     except Exception as e:
-        log("WARN", f"获取用户信息失败: {e}")
+        # 兜底：异常时也尽量输出当时拿到的响应体片段
+        try:
+            preview = resp.text[:300].replace("\n", " ")
+        except Exception:
+            preview = "<no response body>"
+        log("WARN", f"获取用户信息失败: {e} | body={preview!r}")
     return None
 
 def do_check_in(session: requests.Session, headers: dict) -> bool:
