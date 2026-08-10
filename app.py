@@ -1,257 +1,162 @@
 #!/usr/bin/env python3
+"""
+AgentRouter 自动签到（GitHub OAuth 重放方案）
+
+原理：AgentRouter 没有签到 API，签到是 OAuth 登录的副作用。
+本脚本通过模拟 GitHub OAuth 登录流程触发签到：
+  1. GET /api/oauth/state          → 获取 state + acw_tc cookie
+  2. GET github.com/login/oauth/authorize  → 用 GitHub user_session cookie 自动授权，从 302 提取 code
+  3. GET /api/oauth/github?code=...&state=... → 回调登录，触发签到，返回 checked_in
+
+所需环境变量：
+  GITHUB_SESSION  GitHub 的 user_session cookie 值（必填）
+  PROXY_URL       HTTP/SOCKS5 代理地址（可选，GitHub Actions 数据中心 IP 可能被 WAF 拦截时使用）
+"""
 
 import os
 import sys
-import base64
+import re
 import json
-import time
-import subprocess
 import requests
 import traceback
-from datetime import datetime, timezone, timedelta
-from playwright.sync_api import sync_playwright
+from datetime import datetime
 
-# 环境变量配置(session建议填写secrets,需要自动更新)
-# 单账号：SESSION="xxx"
-# 多账号：SESSIONS 传 JSON，例如 [{"name":"a","session":"xxx1","user_id":"1"},{"name":"b","session":"xxx2","user_id":"2"}]
-#         或用逗号分隔的 SESSION 列表：SESSION="xxx1,xxx2" （与 SESSION_USER_IDS 按顺序对应）
-USER_ID      = os.getenv("USER_ID") or ""  # 单账号:用户ID,必填或自动获取
-SESSION      = os.getenv("SESSION") or ""  # 单账号 session 或 逗号分隔多 session
-SESSIONS     = os.getenv("SESSIONS") or ""  # 多账号 JSON 列表
-SESSION_IDS  = os.getenv("SESSION_IDS") or ""  # 与逗号分隔 SESSION 对应的 user_id 列表
-TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN") or ""  # Telegram bot token,不需要通知可以留空
-TG_CHAT_ID   = os.getenv("TG_CHAT_ID") or ""    # Telegram chat id
+# 环境变量配置
+GITHUB_SESSION = os.getenv("GITHUB_SESSION", "").strip()  # GitHub 的 user_session cookie
+PROXY_URL      = os.getenv("PROXY_URL", "").strip()       # 可选代理，如 http://127.0.0.1:7890 或 socks5://...
 
 SITE_URL = "https://agentrouter.org"
-SESSION_TTL_DAYS = 30
-SESSION_THRESHOLD_DAYS = 3
+GITHUB_CLIENT_ID = "Ov23lidtiR4LeVZvVRNL"  # agentrouter 的 GitHub OAuth client_id（从 /api/status 获取）
 QUOTA_PER_DOLLAR = 500000
-WAF_COOKIE_NAMES = ["acw_tc", "cdn_sec_tc", "acw_sc__v2"]
 
-# 工具函数
+UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/138.0.0.0 Safari/537.36"
+)
+
+
 def log(level: str, msg: str):
     ts = datetime.now().strftime("%H:%M:%S")
     print(f"[{ts}] [{level}] {msg}", flush=True)
 
-def decode_session_timestamp(session_value: str) -> int | None:
-    if not session_value:
-        return None
-    parts = session_value.split("|")
-    if parts and parts[0].strip().isdigit():
-        return int(parts[0].strip())
-    if "%7C" in session_value or "%7c" in session_value:
-        decoded_url = session_value.replace("%7C", "|").replace("%7c", "|")
-        parts = decoded_url.split("|")
-        if parts and parts[0].strip().isdigit():
-            return int(parts[0].strip())
-    try:
-        padded = session_value + "=" * (4 - len(session_value) % 4) if len(session_value) % 4 else session_value
-        try:
-            decoded = base64.urlsafe_b64decode(padded)
-        except Exception:
-            decoded = base64.b64decode(padded)
-        decoded_str = decoded.decode("utf-8", errors="ignore")
-        parts = decoded_str.split("|")
-        if parts and parts[0].strip().isdigit():
-            return int(parts[0].strip())
-    except Exception:
-        pass
-    return None
 
-def check_session_expiry(session_value: str):
-    timestamp = decode_session_timestamp(session_value)
-    if not timestamp:
-        log("WARN", "无法解码 Session 时间戳，跳过期检查")
-        return None, False
-    created_time = datetime.fromtimestamp(timestamp, tz=timezone.utc)
-    expiry_time = created_time + timedelta(days=SESSION_TTL_DAYS)
-    now = datetime.now(tz=timezone.utc)
-    remaining = expiry_time - now
-    remaining_days = remaining.total_seconds() / 86400
-    created_local = created_time.astimezone().strftime("%Y-%m-%d %H:%M:%S")
-    expiry_local = expiry_time.astimezone().strftime("%Y-%m-%d %H:%M:%S")
-    log("INFO", f"Session 创建时间: {created_local}")
-    log("INFO", f"Session 过期时间: {expiry_local}")
-    log("INFO", f"剩余有效时间: {remaining_days:.2f} 天")
-    need_update = remaining_days < SESSION_THRESHOLD_DAYS
-    if need_update:
-        log("WARN", f"Session 剩余 {remaining_days:.2f} 天 < {SESSION_THRESHOLD_DAYS} 天，需要更新！")
-    return remaining_days, need_update
-
-def update_github_secret(secret_name: str, new_value: str) -> bool:
-    if not new_value:
-        log("WARN", f"跳过更新 {secret_name}：新值为空")
-        return False
-    masked = new_value[:4] + "..." + new_value[-4:] if len(new_value) > 8 else "***"
-    log("INFO", f"🔄 更新 Secret: {secret_name} (新值: {masked})")
-    try:
-        proc = subprocess.run(
-            ["gh", "secret", "set", secret_name, "--body", new_value],
-            capture_output=True, text=True, timeout=30, check=False,
-        )
-        if proc.returncode == 0:
-            log("INFO", f"✅ {secret_name} 更新成功")
-            return True
-        else:
-            log("ERROR", f"更新失败: {proc.stderr.strip()}")
-            return False
-    except Exception as e:
-        log("ERROR", f"异常: {e}")
-        return False
-
-def send_telegram(message: str) -> bool:
-    if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        log("WARN", "Telegram 配置不完整，跳过发送")
-        print(f"--- 消息内容 ---\n{message}\n---------------")
-        return False
-    try:
-        url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
-        data = {"chat_id": TG_CHAT_ID, "text": message, "parse_mode": "HTML"}
-        resp = requests.post(url, json=data, timeout=30)
-        resp.raise_for_status()
-        log("INFO", "Telegram 消息发送成功")
-        return True
-    except Exception as e:
-        log("ERROR", f"Telegram 发送失败: {e}")
-        return False
-
-# WAF Cookie 获取
-def get_waf_cookies() -> dict:
-    log("INFO", f"使用浏览器获取 WAF Cookie（访问 {SITE_URL}）...")
-    waf_cookies = {}
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-            ],
-        )
-        context = browser.new_context(
-            viewport={"width": 1280, "height": 720},
-            user_agent=(
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
-            ),
-        )
-        page = context.new_page()
-        try:
-            # networkidle 等待网络空闲，确保阿里云 WAF 的 JS 挑战脚本执行完成
-            page.goto(f"{SITE_URL}", wait_until="networkidle", timeout=30000)
-        except Exception as e:
-            log("WARN", f"访问首页失败: {e}")
-        # 显式等待 WAF 挑战完成会种下 acw_sc__v2（关键），最多等 15 秒
-        deadline = time.time() + 15
-        got_critical = False
-        while time.time() < deadline:
-            current = {c.get("name"): c.get("value") for c in context.cookies()}
-            if "acw_sc__v2" in current:
-                got_critical = True
-                break
-            page.wait_for_timeout(500)
-        if not got_critical:
-            log("WARN", "等待 acw_sc__v2 超时（WAF 挑战可能未通过），继续尝试使用已有 cookie")
-        cookies = context.cookies()
-        for cookie in cookies:
-            name = cookie.get("name")
-            value = cookie.get("value")
-            if name in WAF_COOKIE_NAMES and value:
-                waf_cookies[name] = value
-        browser.close()
-    if waf_cookies:
-        log("INFO", f"获取到 {len(waf_cookies)} 个 WAF Cookie: {list(waf_cookies.keys())}")
-    else:
-        log("WARN", "未获取到 WAF Cookie")
-    return waf_cookies
-
-# API 调用
-def build_headers() -> dict:
-    return {
-        "User-Agent": (
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
-        ),
+def build_session() -> requests.Session:
+    """构建请求会话，按需配置代理"""
+    sess = requests.Session()
+    sess.headers.update({
+        "User-Agent": UA,
         "Accept": "application/json, text/plain, */*",
         "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-        "Accept-Encoding": "gzip, deflate, br, zstd",
         "Referer": SITE_URL,
         "Origin": SITE_URL,
-        "Connection": "keep-alive",
-        "Sec-Fetch-Dest": "empty",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Site": "same-origin",
-        "new-api-user": USER_ID,
-    }
+    })
+    if PROXY_URL:
+        proxies = {"http": PROXY_URL, "https": PROXY_URL}
+        sess.proxies.update(proxies)
+        log("INFO", f"使用代理: {PROXY_URL}")
+    else:
+        log("INFO", "直连模式（未配置代理）")
+    return sess
 
-def get_user_info(session: requests.Session, headers: dict) -> dict | None:
-    url = f"{SITE_URL}/api/user/self"
+
+def get_oauth_state(sess: requests.Session) -> str | None:
+    """Step 1: 获取 OAuth state，同时拿到 acw_tc + session cookie"""
+    log("INFO", "Step 1: 获取 OAuth state...")
     try:
-        resp = session.get(url, headers=headers, timeout=30)
-        content_type = resp.headers.get("Content-Type", "")
-        # 200 但响应不是 JSON（WAF 拦截页、空响应等）：打印真实内容便于排查
-        if "application/json" not in content_type.lower() and not resp.text.lstrip().startswith(("{", "[")):
-            preview = resp.text[:300].replace("\n", " ")
-            log("WARN", f"API 响应非 JSON: HTTP {resp.status_code}, Content-Type={content_type!r}, body={preview!r}")
-            return None
-        if resp.status_code == 200:
-            data = resp.json()
-            if data.get("success"):
-                user_data = data.get("data", {})
-                return {
-                    "quota": user_data.get("quota", 0),
-                    "used_quota": user_data.get("used_quota", 0),
-                    "username": user_data.get("username", ""),
-                    "id": user_data.get("id", 0),
-                    "raw": user_data,
-                }
-            else:
-                log("WARN", f"API 返回非成功: {data}")
-        else:
-            preview = resp.text[:300].replace("\n", " ")
-            log("WARN", f"API HTTP {resp.status_code}: Content-Type={content_type!r}, body={preview!r}")
+        resp = sess.get(f"{SITE_URL}/api/oauth/state?mode=login", timeout=30)
     except Exception as e:
-        # 兜底：异常时也尽量输出当时拿到的响应体片段
-        try:
-            preview = resp.text[:300].replace("\n", " ")
-        except Exception:
-            preview = "<no response body>"
-        log("WARN", f"获取用户信息失败: {e} | body={preview!r}")
-    return None
+        log("ERROR", f"请求 /api/oauth/state 失败: {e}")
+        return None
 
-def do_check_in(session: requests.Session, headers: dict) -> bool:
-    # New API 标准签到接口；部分部署用 /api/user/sign_in
-    for path in ("/api/user/sign_in", "/api/user/checkin"):
-        url = f"{SITE_URL}{path}"
-        checkin_headers = headers.copy()
-        checkin_headers["Content-Type"] = "application/json"
-        checkin_headers["X-Requested-With"] = "XMLHttpRequest"
-        try:
-            resp = session.post(url, headers=checkin_headers, timeout=30)
-            log("INFO", f"签到接口响应 ({path}): HTTP {resp.status_code}")
-            if resp.status_code == 200:
-                try:
-                    result = resp.json()
-                    if result.get("ret") == 1 or result.get("code") == 0 or result.get("success"):
-                        log("INFO", "✅ 签到成功！")
-                        return True
-                    error_msg = result.get("msg", result.get("message", "Unknown error"))
-                    already_keywords = ["已经签到", "已签到", "重复签到", "already checked", "already signed"]
-                    if any(kw in str(error_msg).lower() for kw in already_keywords):
-                        log("INFO", "今日已签到过")
-                        return True
-                    log("WARN", f"签到失败: {error_msg}")
-                except json.JSONDecodeError:
-                    if "success" in resp.text.lower():
-                        log("INFO", "✅ 签到成功！")
-                        return True
-                    log("WARN", f"签到响应格式异常: {resp.text[:200]}")
-            else:
-                log("WARN", f"签到失败: HTTP {resp.status_code}: {resp.text[:200]}")
-        except Exception as e:
-            log("ERROR", f"签到请求异常: {e}")
-    return False
+    if "aliyun_waf_aa" in resp.text:
+        log("ERROR", "被阿里云 WAF 拦截（IP 信誉或频率限制），请配置代理或稍后重试")
+        return None
+
+    try:
+        data = resp.json()
+    except Exception:
+        log("ERROR", f"响应非 JSON: HTTP {resp.status_code}, body={resp.text[:200]!r}")
+        return None
+
+    if not data.get("success"):
+        log("ERROR", f"获取 state 失败: {data}")
+        return None
+
+    state = data.get("data", "")
+    if not state:
+        log("ERROR", "state 为空")
+        return None
+
+    log("INFO", f"✅ 获取 state 成功 (cookies: {list(sess.cookies.keys())})")
+    return state
+
+
+def get_github_code(sess: requests.Session, state: str) -> str | None:
+    """Step 2: 用 GitHub user_session 访问授权 URL，从 302 Location 提取 code"""
+    log("INFO", "Step 2: GitHub OAuth 授权，提取 code...")
+    auth_url = f"https://github.com/login/oauth/authorize?client_id={GITHUB_CLIENT_ID}&state={state}"
+    github_cookies = {"user_session": GITHUB_SESSION}
+
+    try:
+        # 不自动跟随重定向，从 Location 头提取 code
+        resp = sess.get(auth_url, cookies=github_cookies, allow_redirects=False, timeout=30)
+    except Exception as e:
+        log("ERROR", f"请求 GitHub 授权失败: {e}")
+        return None
+
+    if resp.status_code == 401 or resp.status_code == 403:
+        log("ERROR", f"GitHub user_session 已失效（HTTP {resp.status_code}），请重新获取")
+        return None
+
+    if resp.status_code != 302:
+        log("ERROR", f"GitHub 未返回 302 重定向（HTTP {resp.status_code}），user_session 可能已失效")
+        log("ERROR", f"响应 body 前 300: {resp.text[:300]!r}")
+        return None
+
+    location = resp.headers.get("Location", "")
+    if not location:
+        log("ERROR", "302 响应缺少 Location 头")
+        return None
+
+    code_match = re.search(r"[?&]code=([^&]+)", location)
+    if not code_match:
+        log("ERROR", f"Location 中未找到 code: {location[:200]}")
+        return None
+
+    code = code_match.group(1)
+    log("INFO", f"✅ 提取到 GitHub code: {code[:16]}...")
+    return code
+
+
+def oauth_callback(sess: requests.Session, code: str, state: str) -> dict | None:
+    """Step 3: 调用 /api/oauth/github 回调，触发签到"""
+    log("INFO", "Step 3: OAuth 回调，触发签到...")
+    callback_url = f"{SITE_URL}/api/oauth/github?code={code}&state={state}&mode=login"
+
+    try:
+        resp = sess.get(callback_url, timeout=30)
+    except Exception as e:
+        log("ERROR", f"OAuth 回调请求失败: {e}")
+        return None
+
+    if "aliyun_waf_aa" in resp.text:
+        log("ERROR", "回调被阿里云 WAF 拦截")
+        return None
+
+    try:
+        data = resp.json()
+    except Exception:
+        log("ERROR", f"回调响应非 JSON: HTTP {resp.status_code}, body={resp.text[:300]!r}")
+        return None
+
+    if not data.get("success"):
+        log("ERROR", f"OAuth 回调失败: {data}")
+        return None
+
+    user_data = data.get("data", {})
+    return user_data
+
 
 def format_balance(quota: int) -> str:
     if quota is None:
@@ -261,123 +166,52 @@ def format_balance(quota: int) -> str:
         return f"{int(balance)}$"
     return f"{balance:.2f}$"
 
-# 主流程
-def parse_accounts() -> list[dict]:
-    """解析账号列表，返回 [{name, session, user_id?}, ...]
-
-    兼容三种填法：
-      1) SESSIONS 为 JSON 数组：[{"name":"A","session":"xxx","user_id":"1"}, ...]
-      2) SESSIONS 为逗号分隔的纯 session：sess1,sess2
-      3) 单账号 SESSION：xxx（或 SESSION 逗号分隔多账号）
-    """
-    accounts: list[dict] = []
-    if SESSIONS and SESSIONS.strip():
-        txt = SESSIONS.strip().lstrip("\ufeff").strip()
-        # 尝试按 JSON 解析
-        try:
-            data = json.loads(txt)
-            if isinstance(data, list):
-                for item in data:
-                    if isinstance(item, dict) and item.get("session"):
-                        accounts.append({
-                            "name": str(item.get("name") or str(item["session"])[:8]),
-                            "session": str(item["session"]),
-                            "user_id": str(item.get("user_id") or ""),
-                        })
-        except Exception:
-            pass
-        # JSON 解析失败或没解析出账号：按逗号分隔纯 session 处理
-        if not accounts:
-            sessions = [s.strip() for s in txt.replace("\n", ",").split(",") if s.strip()]
-            accounts = [
-                {"name": f"账号{i+1}", "session": s, "user_id": ""}
-                for i, s in enumerate(sessions)
-            ]
-        if accounts:
-            return accounts
-    if SESSION:
-        sessions = [s.strip() for s in SESSION.split(",") if s.strip()]
-        ids = [s.strip() for s in SESSION_IDS.split(",") if s.strip()] if SESSION_IDS else []
-        accounts = [
-            {"name": f"账号{i+1}", "session": s, "user_id": ids[i] if i < len(ids) else ""}
-            for i, s in enumerate(sessions)
-        ]
-    return accounts
-
-def run_account_checkin(account: dict) -> dict:
-    """对单个账号执行签到，返回结果统计"""
-    SESSION  = account["session"]
-    USER_ID  = account.get("user_id") or ""
-    acct_name = account.get("name", SESSION[:8])
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    log("INFO", "=" * 50)
-    log("INFO", f"Agentrouter 领币脚本启动 - {acct_name}")
-    log("INFO", f"时间: {now_str}")
-    log("INFO", f"用户 ID: {USER_ID or 'auto'}")
-    log("INFO", "=" * 50)
-
-    if not SESSION:
-        log("ERROR", "SESSION 未配置，请设置 SESSION 环境变量")
-        return {"name": acct_name, "ok": False, "reason": "SESSION 未配置"}
-
-    waf_cookies = get_waf_cookies()
-    session = requests.Session()
-    domain = SITE_URL.replace("https://", "").replace("http://", "").split("/")[0]
-    all_cookies = {}
-    all_cookies.update(waf_cookies)
-    all_cookies["session"] = SESSION
-    if USER_ID:
-        all_cookies["user_id"] = USER_ID
-    for name, value in all_cookies.items():
-        session.cookies.set(name, value, domain=domain, path="/")
-    log("INFO", f"已设置 {len(all_cookies)} 个 Cookie: {list(all_cookies.keys())}")
-
-    headers = build_headers()
-    user_info_1 = get_user_info(session, headers)
-    if not user_info_1:
-        log("ERROR", f"[{acct_name}] API 验证失败，Session 可能已过期")
-        return {"name": acct_name, "ok": False, "reason": "session 过期或 WAF 未通过"}
-
-    log("INFO", f"✅ 登录成功: {user_info_1.get('username')} (id={user_info_1.get('id')})")
-    if not USER_ID and user_info_1.get("id"):
-        headers["new-api-user"] = str(user_info_1["id"])
-
-    first_balance = format_balance(user_info_1.get("quota", 0))
-    log("INFO", f"初始余额: {first_balance}")
-
-    checkin_success = do_check_in(session, headers)
-    time.sleep(3)
-    user_info_2 = get_user_info(session, headers)
-    second_balance = format_balance(user_info_2.get("quota", 0)) if user_info_2 else "N/A"
-    log("INFO", f"刷新后余额: {second_balance}")
-
-    result = {
-        "name": acct_name,
-        "ok": checkin_success,
-        "username": user_info_1.get("username", ""),
-        "first": first_balance,
-        "second": second_balance,
-        "success": checkin_success,
-    }
-    log("INFO", f"[{acct_name}] 执行完毕: 签到={'成功' if checkin_success else '失败/重复'}")
-    return result
 
 def run_checkin():
-    accounts = parse_accounts()
-    if not accounts:
-        log("ERROR", "未配置任何账号！请设置 SESSIONS（JSON 数组或逗号分隔 session）或 SESSION")
-        sys.exit(1)
-    log("INFO", f"共解析 {len(accounts)} 个账号: {[a['name'] for a in accounts]}")
+    log("INFO", "=" * 50)
+    log("INFO", "AgentRouter 签到脚本启动（OAuth 重放方案）")
+    log("INFO", f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    log("INFO", "=" * 50)
 
-    lines = ["🎁 <b>Agentrouter 签到通知</b>", f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", ""]
-    all_result = []
-    for acct in accounts:
-        r = run_account_checkin(acct)
-        all_result.append(r)
-        icon = "✅" if r.get("ok") else "❌"
-        lines.append(f"{icon} {r.get('name','')} ({r.get('username','')})  {r.get('first','')}→{r.get('second','')}  {r.get('reason','')}")
-    send_telegram("\n".join(lines))
-    log("INFO", "=== 全部账号执行完毕 ===")
+    if not GITHUB_SESSION:
+        log("ERROR", "GITHUB_SESSION 未配置！请设置 GitHub 的 user_session cookie")
+        log("ERROR", "获取方式：浏览器登录 github.com → F12 → Application → Cookies → user_session")
+        sys.exit(1)
+
+    sess = build_session()
+
+    # Step 1: 获取 state
+    state = get_oauth_state(sess)
+    if not state:
+        sys.exit(1)
+
+    # Step 2: GitHub 授权拿 code
+    code = get_github_code(sess, state)
+    if not code:
+        sys.exit(1)
+
+    # Step 3: OAuth 回调触发签到
+    user_data = oauth_callback(sess, code, state)
+    if not user_data:
+        sys.exit(1)
+
+    # 结果展示
+    username   = user_data.get("username", "")
+    display    = user_data.get("display_name", "")
+    uid        = user_data.get("id", "")
+    quota      = user_data.get("quota", 0)
+    used       = user_data.get("used_quota", 0)
+    checked_in = user_data.get("checked_in")
+
+    log("INFO", "=" * 50)
+    log("INFO", f"✅ 登录成功: {username} ({display})")
+    log("INFO", f"   用户 ID: {uid}")
+    log("INFO", f"   当前余额: {format_balance(quota)} (quota={quota})")
+    log("INFO", f"   已用额度: {format_balance(used)} (used_quota={used})")
+    log("INFO", f"   今日签到: {'✅ 已签到' if checked_in else '❌ 未签到'}")
+    log("INFO", "=" * 50)
+    log("INFO", "=== 签到流程完成 ===")
+
 
 def main():
     try:
@@ -386,16 +220,10 @@ def main():
         log("WARN", "用户中断")
         sys.exit(130)
     except Exception as e:
-        error_msg = f"{type(e).__name__}: {e}"
-        log("ERROR", f"脚本执行出错: {error_msg}")
+        log("ERROR", f"脚本执行出错: {type(e).__name__}: {e}")
         log("ERROR", traceback.format_exc())
-        send_telegram(
-            f"❌ <b>Agentrouter 脚本异常</b>\n"
-            f"👤 账户: {USER_ID or 'unknown'}\n"
-            f"⏱️ 时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"📝 错误: {error_msg}"
-        )
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()

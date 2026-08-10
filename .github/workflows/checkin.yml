@@ -22,18 +22,12 @@ jobs:
           python-version: '3.11'
 
       - name: Install Python dependencies
-        run: |
-          pip install requests playwright pynacl
-          playwright install --with-deps chromium
+        run: pip install requests
 
       - name: Run check-in script
         env:
-          USER_ID: ${{ secrets.USER_ID }}
-          SESSION: ${{ secrets.SESSION }}
-          SESSIONS: ${{ secrets.SESSIONS }}
-          SESSION_IDS: ${{ secrets.SESSION_IDS }}
-          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          GITHUB_SESSION: ${{ secrets.GITHUB_SESSION }}
+          PROXY_URL: ${{ secrets.PROXY_URL }}
         run: python app.py
 
       - name: clear old run jobs
