@@ -18,7 +18,9 @@ fork 本项目或 push 到你自己的仓库后，在 **Settings → Secrets and
 | Secret 名称 | 是否必填 | 说明 |
 |---|---|---|
 | `GH_SESSION` | ✅ 必填 | GitHub 的 `user_session` cookie 值 |
-| `PROXY_URL` | ❌ 可选 | 代理地址（如 `http://host:port` 或 `socks5://host:port`），GitHub Actions 数据中心 IP 可能被阿里云 WAF 拦截时使用 |
+| `SUB_URL` | ❌ 可选 | Clash/V2Ray 订阅链接，用于在 GitHub Actions 中启动 mihomo 代理绕过 WAF（数据中心 IP 易被拦截） |
+
+> 如果不配置 `SUB_URL`，脚本会以直连模式运行。但 GitHub Actions 的 Azure 数据中心 IP 通常会被阿里云 WAF 拦截，建议配置。
 
 ## 获取 GitHub `user_session`
 
@@ -48,4 +50,12 @@ https://github.com/login/oauth/authorize?client_id=Ov23lidtiR4LeVZvVRNL&state=te
 
 ## 关于 IP 信誉问题
 
-GitHub Actions 使用 Azure 数据中心 IP，可能被阿里云 WAF 的 IP 信誉机制拦截。如遇到 WAF 拦截，配置 `PROXY_URL` Secret 走代理即可。
+GitHub Actions 使用 Azure 数据中心 IP，会被阿里云 WAF 的 IP 信誉机制拦截。本项目通过在 workflow 中启动 mihomo 代理解决：
+
+1. 配置 `SUB_URL` Secret（你的 Clash/V2Ray 订阅链接）
+2. workflow 会自动拉取订阅、生成 mihomo 配置、启动代理
+3. 脚本通过 `http://127.0.0.1:7890` 走代理发起请求
+
+支持的订阅格式：
+- Clash YAML 配置
+- Base64 编码的 vmess/vless/trojan/ss 订阅链接列表
