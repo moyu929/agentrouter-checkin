@@ -9,7 +9,7 @@ AgentRouter 自动签到（GitHub OAuth 重放方案）
   3. GET /api/oauth/github?code=...&state=... → 回调登录，触发签到，返回 checked_in
 
 所需环境变量：
-  GITHUB_SESSION  GitHub 的 user_session cookie 值（必填）
+  GH_SESSION      GitHub 的 user_session cookie 值（必填）
   PROXY_URL       HTTP/SOCKS5 代理地址（可选，GitHub Actions 数据中心 IP 可能被 WAF 拦截时使用）
 """
 
@@ -22,7 +22,7 @@ import traceback
 from datetime import datetime
 
 # 环境变量配置
-GITHUB_SESSION = os.getenv("GITHUB_SESSION", "").strip()  # GitHub 的 user_session cookie
+GH_SESSION = os.getenv("GH_SESSION", "").strip()  # GitHub 的 user_session cookie
 PROXY_URL      = os.getenv("PROXY_URL", "").strip()       # 可选代理，如 http://127.0.0.1:7890 或 socks5://...
 
 SITE_URL = "https://agentrouter.org"
@@ -96,7 +96,7 @@ def get_github_code(sess: requests.Session, state: str) -> str | None:
     """Step 2: 用 GitHub user_session 访问授权 URL，从 302 Location 提取 code"""
     log("INFO", "Step 2: GitHub OAuth 授权，提取 code...")
     auth_url = f"https://github.com/login/oauth/authorize?client_id={GITHUB_CLIENT_ID}&state={state}"
-    github_cookies = {"user_session": GITHUB_SESSION}
+    github_cookies = {"user_session": GH_SESSION}
 
     try:
         # 不自动跟随重定向，从 Location 头提取 code
@@ -173,8 +173,8 @@ def run_checkin():
     log("INFO", f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     log("INFO", "=" * 50)
 
-    if not GITHUB_SESSION:
-        log("ERROR", "GITHUB_SESSION 未配置！请设置 GitHub 的 user_session cookie")
+    if not GH_SESSION:
+        log("ERROR", "GH_SESSION 未配置！请设置 GitHub 的 user_session cookie")
         log("ERROR", "获取方式：浏览器登录 github.com → F12 → Application → Cookies → user_session")
         sys.exit(1)
 

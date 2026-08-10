@@ -26,7 +26,7 @@ jobs:
 
       - name: Run check-in script
         env:
-          GITHUB_SESSION: ${{ secrets.GITHUB_SESSION }}
+          GH_SESSION: ${{ secrets.GH_SESSION }}
           PROXY_URL: ${{ secrets.PROXY_URL }}
         run: python app.py
 
