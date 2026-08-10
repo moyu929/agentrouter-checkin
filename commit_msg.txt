@@ -1,8 +1,0 @@
-feat: 集成 mihomo 代理绕过 GitHub Actions WAF 拦截
-
-- 新增 scripts/setup_proxy.py：拉取订阅并生成 mihomo 配置
-  支持 Clash YAML 和 base64 编码的 vmess/vless/trojan/ss 订阅
-- workflow 新增 "Setup proxy" 步骤：自动拉订阅、下载 mihomo、启动代理
-  脚本通过 http://127.0.0.1:7890 走代理发起请求
-- Secret 新增 SUB_URL（订阅链接），PROXY_URL 改为 workflow 内部生成
-- README 更新代理使用说明
