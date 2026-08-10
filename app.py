@@ -37,6 +37,9 @@ UA = (
 
 
 def log(level: str, msg: str):
+    """日志输出。DEBUG 级别受 DEBUG 环境变量控制（默认开启便于诊断）"""
+    if level == "DEBUG" and os.getenv("DEBUG", "1").lower() in ("0", "false", "no"):
+        return
     ts = datetime.now().strftime("%H:%M:%S")
     print(f"[{ts}] [{level}] {msg}", flush=True)
 
@@ -63,14 +66,24 @@ def build_session() -> requests.Session:
 def get_oauth_state(sess: requests.Session) -> str | None:
     """Step 1: 获取 OAuth state，同时拿到 acw_tc + session cookie"""
     log("INFO", "Step 1: 获取 OAuth state...")
+    req_url = f"{SITE_URL}/api/oauth/state?mode=login"
+    log("DEBUG", f"请求: GET {req_url}")
+    log("DEBUG", f"当前会话 cookies: {dict(sess.cookies)}")
+
     try:
-        resp = sess.get(f"{SITE_URL}/api/oauth/state?mode=login", timeout=30)
+        resp = sess.get(req_url, timeout=30)
     except Exception as e:
-        log("ERROR", f"请求 /api/oauth/state 失败: {e}")
+        log("ERROR", f"请求 /api/oauth/state 失败: {type(e).__name__}: {e}")
         return None
+
+    log("DEBUG", f"响应: HTTP {resp.status_code}")
+    log("DEBUG", f"响应头: Content-Type={resp.headers.get('Content-Type')}, Content-Length={resp.headers.get('Content-Length')}")
+    log("DEBUG", f"Set-Cookie: {resp.headers.get('Set-Cookie', '(无)')}")
+    log("DEBUG", f"响应 body 前 500 字符: {resp.text[:500]!r}")
 
     if "aliyun_waf_aa" in resp.text:
         log("ERROR", "被阿里云 WAF 拦截（IP 信誉或频率限制），请配置代理或稍后重试")
+        log("ERROR", f"完整 WAF 拦截页面前 1000 字符:\n{resp.text[:1000]}")
         return None
 
     try:
@@ -88,7 +101,7 @@ def get_oauth_state(sess: requests.Session) -> str | None:
         log("ERROR", "state 为空")
         return None
 
-    log("INFO", f"✅ 获取 state 成功 (cookies: {list(sess.cookies.keys())})")
+    log("INFO", f"✅ 获取 state 成功: {state[:32]}... (cookies: {list(sess.cookies.keys())})")
     return state
 
 
@@ -97,13 +110,21 @@ def get_github_code(sess: requests.Session, state: str) -> str | None:
     log("INFO", "Step 2: GitHub OAuth 授权，提取 code...")
     auth_url = f"https://github.com/login/oauth/authorize?client_id={GITHUB_CLIENT_ID}&state={state}"
     github_cookies = {"user_session": GH_SESSION}
+    log("DEBUG", f"请求: GET {auth_url}")
+    log("DEBUG", f"GitHub user_session 长度: {len(GH_SESSION)}, 前 8 字符: {GH_SESSION[:8]}...")
+    log("DEBUG", f"附加 cookies: {list(github_cookies.keys())}")
 
     try:
         # 不自动跟随重定向，从 Location 头提取 code
         resp = sess.get(auth_url, cookies=github_cookies, allow_redirects=False, timeout=30)
     except Exception as e:
-        log("ERROR", f"请求 GitHub 授权失败: {e}")
+        log("ERROR", f"请求 GitHub 授权失败: {type(e).__name__}: {e}")
         return None
+
+    log("DEBUG", f"响应: HTTP {resp.status_code}")
+    log("DEBUG", f"响应头 Location: {resp.headers.get('Location', '(无)')}")
+    log("DEBUG", f"响应头 Set-Cookie: {resp.headers.get('Set-Cookie', '(无)')}")
+    log("DEBUG", f"响应 body 前 500 字符: {resp.text[:500]!r}")
 
     if resp.status_code == 401 or resp.status_code == 403:
         log("ERROR", f"GitHub user_session 已失效（HTTP {resp.status_code}），请重新获取")
@@ -111,7 +132,7 @@ def get_github_code(sess: requests.Session, state: str) -> str | None:
 
     if resp.status_code != 302:
         log("ERROR", f"GitHub 未返回 302 重定向（HTTP {resp.status_code}），user_session 可能已失效")
-        log("ERROR", f"响应 body 前 300: {resp.text[:300]!r}")
+        log("ERROR", f"响应 body 前 500: {resp.text[:500]!r}")
         return None
 
     location = resp.headers.get("Location", "")
@@ -126,6 +147,7 @@ def get_github_code(sess: requests.Session, state: str) -> str | None:
 
     code = code_match.group(1)
     log("INFO", f"✅ 提取到 GitHub code: {code[:16]}...")
+    log("DEBUG", f"完整 Location: {location}")
     return code
 
 
@@ -133,21 +155,29 @@ def oauth_callback(sess: requests.Session, code: str, state: str) -> dict | None
     """Step 3: 调用 /api/oauth/github 回调，触发签到"""
     log("INFO", "Step 3: OAuth 回调，触发签到...")
     callback_url = f"{SITE_URL}/api/oauth/github?code={code}&state={state}&mode=login"
+    log("DEBUG", f"请求: GET {callback_url}")
+    log("DEBUG", f"会话 cookies: {dict(sess.cookies)}")
 
     try:
         resp = sess.get(callback_url, timeout=30)
     except Exception as e:
-        log("ERROR", f"OAuth 回调请求失败: {e}")
+        log("ERROR", f"OAuth 回调请求失败: {type(e).__name__}: {e}")
         return None
+
+    log("DEBUG", f"响应: HTTP {resp.status_code}")
+    log("DEBUG", f"响应头: Content-Type={resp.headers.get('Content-Type')}")
+    log("DEBUG", f"Set-Cookie: {resp.headers.get('Set-Cookie', '(无)')}")
+    log("DEBUG", f"响应 body 前 1000 字符: {resp.text[:1000]!r}")
 
     if "aliyun_waf_aa" in resp.text:
         log("ERROR", "回调被阿里云 WAF 拦截")
+        log("ERROR", f"完整 WAF 拦截页面前 1000 字符:\n{resp.text[:1000]}")
         return None
 
     try:
         data = resp.json()
     except Exception:
-        log("ERROR", f"回调响应非 JSON: HTTP {resp.status_code}, body={resp.text[:300]!r}")
+        log("ERROR", f"回调响应非 JSON: HTTP {resp.status_code}, body={resp.text[:500]!r}")
         return None
 
     if not data.get("success"):
@@ -155,6 +185,7 @@ def oauth_callback(sess: requests.Session, code: str, state: str) -> dict | None
         return None
 
     user_data = data.get("data", {})
+    log("DEBUG", f"回调返回字段: {list(user_data.keys())}")
     return user_data
 
 
@@ -179,6 +210,15 @@ def run_checkin():
         sys.exit(1)
 
     sess = build_session()
+
+    # 检测出口 IP（诊断代理是否生效）
+    if PROXY_URL:
+        try:
+            ip_resp = sess.get("https://api.ipify.org?format=json", timeout=15)
+            exit_ip = ip_resp.json().get("ip", "unknown")
+            log("INFO", f"当前出口 IP: {exit_ip}")
+        except Exception as e:
+            log("WARN", f"无法获取出口 IP: {e}")
 
     # Step 1: 获取 state
     state = get_oauth_state(sess)

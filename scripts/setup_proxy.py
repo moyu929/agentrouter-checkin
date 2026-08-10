@@ -168,14 +168,16 @@ def generate_mihomo_config(proxies: list) -> dict:
 
     return {
         "mixed-port": 7890,
-        "mode": "global",
+        "mode": "rule",
         "log-level": "warning",
         "proxies": valid_proxies,
         "proxy-groups": [
             {
                 "name": "PROXY",
-                "type": "select",
-                "proxies": [p["name"] for p in valid_proxies] + ["DIRECT"],
+                "type": "url-test",
+                "proxies": [p["name"] for p in valid_proxies],
+                "url": "https://www.gstatic.com/generate_204",
+                "interval": 300,
             }
         ],
         "rules": ["MATCH,PROXY"],
